@@ -7,10 +7,17 @@ use libp2p::bytes::BytesMut;
 use libp2p::core::UpgradeInfo;
 use libp2p::identity::{Keypair, PublicKey};
 use unsigned_varint::codec::UviBytes;
+use serde::{Deserialize, Serialize};
 
 #[derive(Clone)]
 pub struct TestHandshake {
     identity: Keypair,
+}
+
+#[derive(Serialize, Deserialize)]
+struct HandshakeInfo {
+    public_key: Vec<u8>,
+    signature: Vec<u8>,
 }
 
 impl TestHandshake {
@@ -23,49 +30,42 @@ impl TestHandshake {
             T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
             U: Encoder<Item=BytesMut>,
     {
-        // Send public key.
         let encoded_key = self.identity.public().encode_protobuf();
 
-        framed_socket.send(BytesMut::from(encoded_key.as_slice()))
-            .await
-            .map_err(|_| TestHandshakeError::SendError)?;
-
-        // Send signature.
         let local_peer_id = PeerId::from(self.identity.public());
 
         let sig = self.identity.sign(local_peer_id.to_bytes().as_slice())
             .map_err(|_| TestHandshakeError::SigningError)?;
 
-        framed_socket.send(BytesMut::from(sig.as_slice()))
+        let handshake_info = HandshakeInfo { public_key: encoded_key, signature: sig };
+
+        let msg = serde_json::to_vec(&handshake_info).map_err(|_| TestHandshakeError::JSONEncodeError)?;
+
+        framed_socket.send(BytesMut::from(msg.as_slice()))
             .await
             .map_err(|_| TestHandshakeError::SendError)?;
 
         Ok(())
     }
 
-    async fn receive_handshake_info<T, U>(&self, framed_socket: &mut Framed<T, U>) -> Result<(PublicKey, PeerId, BytesMut), TestHandshakeError>
+    async fn receive_handshake_info<T, U>(&self, framed_socket: &mut Framed<T, U>) -> Result<(PublicKey, PeerId, Vec<u8>), TestHandshakeError>
         where
             T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
             U: Decoder<Item=BytesMut>,
     {
-        // Receive public key.
         let rec = framed_socket.next()
             .await
             .ok_or(TestHandshakeError::AwaitError)?
             .map_err(|_| TestHandshakeError::ReceiveError)?;
 
-        let remote_public_key = PublicKey::try_decode_protobuf(&rec)
+        let handshake_info: HandshakeInfo = serde_json::from_slice(&rec).map_err(|_| TestHandshakeError::JSONDecodeError)?;
+
+        let remote_public_key = PublicKey::try_decode_protobuf(&handshake_info.public_key)
             .map_err(|_| TestHandshakeError::KeyDecodeError)?;
 
         let remote_peer_id = PeerId::from(&remote_public_key);
 
-        // Receive signature.
-        let sig = framed_socket.next()
-            .await
-            .ok_or(TestHandshakeError::AwaitError)?
-            .map_err(|_| TestHandshakeError::ReceiveError)?;
-
-        Ok((remote_public_key, remote_peer_id, sig))
+        Ok((remote_public_key, remote_peer_id, handshake_info.signature))
     }
 }
 
@@ -148,4 +148,8 @@ pub enum TestHandshakeError {
     SignatureError,
     #[error("Key decode error")]
     KeyDecodeError,
+    #[error("JSON encode error")]
+    JSONEncodeError,
+    #[error("JSON decode error")]
+    JSONDecodeError,
 }
